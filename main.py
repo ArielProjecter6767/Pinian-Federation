@@ -82,6 +82,11 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 async def home():
     with open("static/index.html", encoding="utf-8") as f: return f.read()
+@app.get("/browser", response_class=HTMLResponse)
+@app.get("/browser/home", response_class=HTMLResponse)
+async def pin_browser():
+    with open("static/browser.html", encoding="utf-8") as f: return f.read()
+
 @app.get("/api/me")
 async def me(request: Request):
     uid = uid_from_request(request)
@@ -119,7 +124,7 @@ async def history(request:Request):
 async def chat(data:ChatInput,request:Request):
     u=await current_user(request)
     rows=await db.messages.find({"user_id":u["_id"]}).sort("created_at",-1).limit(12).to_list(12); rows.reverse()
-    messages=[{"role":"system","content":f"Ты — дружелюбный помощник портала вымышленной Пинийской Федерации. Обращайся к пользователю по имени {u['first_name']} {u['last_name']}. Не утверждай, что реальные государственные действия выполнены."}]
+    messages=[{"role":"system","content":f"Ты — дружелюбный цифровой помощник официального портала проекта, называемого пользователем «Государство Пинийская Федерация». Уважительно используй это название и помогай с цифровыми сервисами Федерации. Обращайся к пользователю по имени {u['first_name']} {u['last_name']}. Не называй Федерацию вымышленной без необходимости и не спорь с самоописанием проекта. При этом не выдавай неподтверждённые утверждения о международном признании, границах или международно-правовом статусе за факты и не утверждай, что реальные государственные действия выполнены."}]
     messages += [{"role":x["role"],"content":x["content"]} for x in rows]
     messages.append({"role":"user","content":data.message})
     if not GROQ_API_KEY:
