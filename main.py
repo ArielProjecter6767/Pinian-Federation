@@ -1,9 +1,9 @@
-import os, re, uuid, secrets, base64, hashlib
+import os, re, uuid, secrets, base64, hashlib, gzip, json, mimetypes
 from datetime import datetime, timezone
 from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -82,6 +82,54 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 async def home():
     with open("static/index.html", encoding="utf-8") as f: return f.read()
+@app.get("/api/pin-sites/{name}/files/{file_path:path}")
+async def read_pin_site_file(name: str, file_path: str):
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    site_name = re.sub(r"[^a-z0-9-]", "-", name.strip().lower()).strip("-")
+    path = file_path.replace("\\\\", "/").strip("/")
+    if not site_name or not path or any(part in ("", ".", "..") for part in path.split("/")):
+        raise HTTPException(400, "Некорректный путь файла")
+    site = await db.pincode_sites.find_one({"name": site_name}, {"_id": 0, "owner_id": 0})
+    if not site:
+        site = await db.sites.find_one({"name": site_name}, {"_id": 0, "owner_id": 0})
+    if not site:
+        raise HTTPException(404, "Сайт .pin не найден")
+    files = site.get("files")
+    if not isinstance(files, dict):
+        try:
+            files = json.loads(gzip.decompress(base64.b64decode(site["files_gzip_b64"])).decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(500, "Не удалось прочитать файлы опубликованного сайта") from exc
+    content = files.get(path)
+    if not isinstance(content, str):
+        raise HTTPException(404, "Файл не найден на опубликованном сайте")
+    mime, _ = mimetypes.guess_type(path)
+    return Response(content=content, media_type=mime or "text/plain", headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
+@app.get("/api/pin-sites/{name}")
+async def read_pin_site(name: str):
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    site_name = re.sub(r"[^a-z0-9-]", "-", name.strip().lower()).strip("-")
+    if not site_name:
+        raise HTTPException(400, "Некорректное имя сайта")
+    site = await db.pincode_sites.find_one({"name": site_name}, {"_id": 0, "owner_id": 0})
+    if not site:
+        site = await db.sites.find_one({"name": site_name}, {"_id": 0, "owner_id": 0})
+    if not site:
+        raise HTTPException(404, "Сайт .pin не найден. Сначала опубликуй его в PinCode.")
+    files = site.get("files")
+    if not isinstance(files, dict):
+        try:
+            files = json.loads(gzip.decompress(base64.b64decode(site["files_gzip_b64"])).decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(500, "Не удалось прочитать файлы опубликованного сайта") from exc
+    entry = site.get("entry_file", "index.html")
+    if not isinstance(files, dict) or entry not in files:
+        raise HTTPException(500, "В публикации отсутствует стартовый HTML-файл")
+    return {"name": site_name, "entry_file": entry, "files": files}
+
 @app.get("/browser", response_class=HTMLResponse)
 @app.get("/browser/home", response_class=HTMLResponse)
 async def pin_browser():
