@@ -1,4 +1,4 @@
-import os, re, uuid, secrets, base64, hashlib
+import os, re, uuid, secrets, base64, hashlib, hashlib
 from datetime import datetime, timezone
 from typing import Optional
 import httpx
@@ -101,6 +101,29 @@ async def create_pincode_auth_code(request: Request):
         "created_at": now(),
     })
     return {"code": code, "expires_in": 120}
+
+@app.get("/pincode/authorize", response_class=HTMLResponse)
+async def pincode_authorize_page():
+    return HTMLResponse("""<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход в PinCode</title><style>body{font:16px system-ui;background:#101716;color:#e8f2ef;max-width:620px;margin:10vh auto;padding:24px}main{background:#1b2724;border:1px solid #344a43;border-radius:14px;padding:28px}button{background:#28a88d;color:#061b16;border:0;border-radius:8px;padding:12px 18px;font-weight:700;cursor:pointer}code{display:block;font-size:24px;letter-spacing:2px;padding:18px;background:#101716;border-radius:8px;overflow-wrap:anywhere;margin:16px 0}.muted{color:#b4c8c1}#status{white-space:pre-wrap}</style><main><h1>Вход в PinCode</h1><p class="muted">Создай одноразовый код для подключения PinCode к текущему аккаунту Федерации. Код действует 2 минуты и используется только один раз.</p><button id="make">Создать код входа</button><div id="result" hidden><code id="code"></code><button id="copy">Скопировать код</button></div><p id="status" class="muted">Если потребуется, сначала войди в аккаунт Федерации в этом браузере.</p><script>const status=document.getElementById('status');document.getElementById('make').onclick=async()=>{const b=document.getElementById('make');b.disabled=true;status.textContent='Создаю одноразовый код…';try{const r=await fetch('/api/pincode/auth-code',{method:'POST',credentials:'same-origin'});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Не удалось создать код. Войди в Федерацию и попробуй снова.');document.getElementById('code').textContent=d.code;document.getElementById('result').hidden=false;status.textContent='Код готов. Вернись в PinCode и вставь его в окно входа. Он действует 2 минуты.';}catch(e){status.textContent=e.message;}finally{b.disabled=false;}};document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(document.getElementById('code').textContent);status.textContent='Код скопирован. Вернись в PinCode и вставь его.';}catch{status.textContent='Выдели код и скопируй его вручную.';}};</script></main></html>""")
+
+@app.post("/api/pincode/exchange")
+async def exchange_pincode_auth_code(payload: dict):
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    code = str(payload.get("code", "")).strip()
+    if len(code) < 20 or len(code) > 100:
+        raise HTTPException(400, "Одноразовый код неверен или истёк")
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    record = await db.pincode_auth_codes.find_one_and_delete({
+        "_id": code_hash,
+        "expires_at": {"$gt": now().timestamp()},
+    })
+    if not record:
+        raise HTTPException(401, "Одноразовый код неверен, уже использован или истёк. Создай новый код.")
+    user = await db.users.find_one({"_id": record.get("uid")}, {"_id": 1, "first_name": 1, "last_name": 1})
+    if not user:
+        raise HTTPException(401, "Аккаунт Федерации не найден")
+    return {"ok": True, "uid": user["_id"], "first_name": user.get("first_name", ""), "last_name": user.get("last_name", "")}
 
 @app.get("/api/me")
 async def me(request: Request):
