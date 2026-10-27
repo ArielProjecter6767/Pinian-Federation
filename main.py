@@ -1,4 +1,4 @@
-import os, re, uuid, secrets, base64
+import os, re, uuid, secrets, base64, hashlib
 from datetime import datetime, timezone
 from typing import Optional
 import httpx
@@ -86,6 +86,21 @@ async def home():
 @app.get("/browser/home", response_class=HTMLResponse)
 async def pin_browser():
     with open("static/browser.html", encoding="utf-8") as f: return f.read()
+
+@app.post("/api/pincode/auth-code")
+async def create_pincode_auth_code(request: Request):
+    user = await current_user(request)
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    code = secrets.token_urlsafe(24)
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    await db.pincode_auth_codes.insert_one({
+        "_id": code_hash,
+        "uid": user["_id"],
+        "expires_at": now().timestamp() + 120,
+        "created_at": now(),
+    })
+    return {"code": code, "expires_in": 120}
 
 @app.get("/api/me")
 async def me(request: Request):
