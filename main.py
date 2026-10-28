@@ -288,6 +288,7 @@ PINSTAGRAM_SESSION_MAX_AGE = 31536000
 
 class PinstagramRegisterInput(BaseModel):
     nickname: str = Field(min_length=3, max_length=24, pattern=r"^[A-Za-z0-9_.]+$")
+    password: str = Field(min_length=8, max_length=128)
     avatar_data: Optional[str] = Field(default=None, max_length=1700000)
 
 class PinstagramPostInput(BaseModel):
@@ -300,8 +301,25 @@ class PinstagramCommentInput(BaseModel):
 def pinstagram_public_user(user):
     if not user:
         return None
+    created = user.get("created_at")
     return {"id": str(user.get("_id", "")), "nickname": user.get("nickname", "user"),
-            "avatar_data": user.get("avatar_data"), "created_at": user.get("created_at")}
+            "avatar_data": user.get("avatar_data"), "created_at": created.isoformat() if hasattr(created, "isoformat") else created}
+
+def pinstagram_password_hash(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 310000).hex()
+    return {"password_salt": salt, "password_hash": digest}
+
+def pinstagram_password_matches(user, password):
+    salt = user.get("password_salt", "")
+    expected = user.get("password_hash", "")
+    if not salt or not expected:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 310000).hex()
+    return secrets.compare_digest(actual, expected)
+
+def pinstagram_iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
 
 def pinstagram_session_user(request: Request):
     token = request.cookies.get(PINSTAGRAM_SESSION_COOKIE)
@@ -360,7 +378,8 @@ async def pinstagram_register(payload: PinstagramRegisterInput, request: Request
         raise HTTPException(409, "Этот никнейм уже зарегистрирован. Войди через форму входа.")
     uid = uuid.uuid4().hex
     user = {"_id": uid, "nickname": nickname, "nickname_lower": nickname.lower(),
-            "avatar_data": payload.avatar_data, "created_at": now()}
+            "avatar_data": payload.avatar_data, "created_at": now(),
+            **pinstagram_password_hash(payload.password)}
     await db.pinstagram_users.insert_one(user)
     response = JSONResponse({"ok": True, "user": pinstagram_public_user(user)})
     pinstagram_set_cookie(response, uid)
@@ -373,8 +392,9 @@ async def pinstagram_login(payload: PinstagramRegisterInput, request: Request):
     nickname = payload.nickname.strip()
     user = await db.pinstagram_users.find_one({"nickname_lower": nickname.lower()})
     if not user:
-        raise HTTPException(404, "Такой никнейм ещё не зарегистрирован.")
-    # Nickname-only sign-in is intentionally simple but does not prove account ownership.
+        raise HTTPException(401, "Неверный никнейм или пароль.")
+    if not pinstagram_password_matches(user, payload.password):
+        raise HTTPException(401, "Неверный никнейм или пароль.")
     if payload.avatar_data and pinstagram_valid_image(payload.avatar_data, 1600000):
         await db.pinstagram_users.update_one({"_id": user["_id"]}, {"$set": {"avatar_data": payload.avatar_data}})
         user["avatar_data"] = payload.avatar_data
@@ -408,9 +428,9 @@ async def pinstagram_posts(request: Request):
         comments = (post.get("comments") or [])[-30:]
         out.append({"id": str(post["_id"]), "author": pinstagram_public_user(author),
             "caption": post.get("caption", ""), "image_data": post.get("image_data", ""),
-            "created_at": post.get("created_at", ""), "like_count": len(post.get("likes") or []),
+            "created_at": pinstagram_iso(post.get("created_at", "")), "like_count": len(post.get("likes") or []),
             "liked_by_me": user["_id"] in (post.get("likes") or []), "comment_count": len(post.get("comments") or []),
-            "comments": [{"nickname": c.get("nickname", "user"), "text": c.get("text", ""), "created_at": c.get("created_at", "")} for c in comments],
+            "comments": [{"nickname": c.get("nickname", "user"), "text": c.get("text", ""), "created_at": pinstagram_iso(c.get("created_at", ""))} for c in comments],
             "is_following_author": post.get("author_id") in following_ids})
     return {"posts": out, "following": list(following_ids)}
 
