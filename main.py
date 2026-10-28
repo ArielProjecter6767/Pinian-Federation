@@ -497,3 +497,121 @@ async def pinstagram_toggle_follow(target_id: str, request: Request):
     await db.pinstagram_follows.insert_one({"_id": uuid.uuid4().hex, "follower_id": user["_id"],
         "followed_id": target_id, "created_at": now()})
     return {"ok": True, "following": True}
+
+
+# Caucasus Online multiplayer API. World/chat state is intentionally in memory;
+# only the existing Federation account is persisted in MongoDB.
+from fastapi import WebSocket, WebSocketDisconnect
+
+caucasus_players = {}
+caucasus_sockets = {}
+caucasus_chat = []
+
+class CaucasusGuestInput(BaseModel):
+    nickname: Optional[str] = Field(default=None, min_length=1, max_length=32)
+
+def caucasus_nickname(user):
+    first = (user.get("first_name") or "").strip()
+    last = (user.get("last_name") or "").strip()
+    return (first + (" " + last if last else "")).strip() or "Player"
+
+@app.get("/caucasus", response_class=HTMLResponse)
+async def caucasus_page():
+    with open("static/caucasus.html", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/api/caucasus/config")
+async def caucasus_config():
+    token = os.getenv("CESIUM_ION_TOKEN", "") or os.getenv("CESIUM_TOKEN", "")
+    if not token:
+        raise HTTPException(503, "Cesium Ion token is not configured on the server. Add CESIUM_ION_TOKEN in Render.")
+    return {"ok": True, "ion_token": token}
+
+@app.post("/api/caucasus/guest")
+async def caucasus_guest(payload: CaucasusGuestInput, request: Request):
+    user = await current_user(request)
+    uid = str(user["_id"])
+    return {"ok": True, "user": {"id": uid, "nickname": caucasus_nickname(user)}}
+
+@app.websocket("/ws/caucasus")
+async def caucasus_websocket(websocket: WebSocket):
+    uid = uid_from_request(websocket)
+    if not uid or db is None:
+        await websocket.close(code=4401, reason="Sign in to Pinian Federation first")
+        return
+    user = await db.users.find_one({"_id": uid})
+    if not user:
+        await websocket.close(code=4401, reason="Federation account not found")
+        return
+    uid = str(uid)
+    nickname = caucasus_nickname(user)
+    await websocket.accept()
+    caucasus_sockets[uid] = websocket
+    previous = caucasus_players.get(uid, {})
+    player = {"id": uid, "nickname": nickname, "lon": float(previous.get("lon", 43.2)),
+              "lat": float(previous.get("lat", 42.6)), "joined_at": now().isoformat()}
+    caucasus_players[uid] = player
+
+    async def send_json_safe(sock, data):
+        try:
+            await sock.send_json(data)
+            return True
+        except Exception:
+            return False
+
+    async def broadcast(data):
+        for pid, sock in list(caucasus_sockets.items()):
+            if not await send_json_safe(sock, data):
+                if caucasus_sockets.get(pid) is sock:
+                    caucasus_sockets.pop(pid, None)
+
+    await send_json_safe(websocket, {"type": "hello", "user": {"id": uid, "nickname": nickname},
+                                    "position": {"lon": player["lon"], "lat": player["lat"]},
+                                    "messages": caucasus_chat[-50:]})
+    await broadcast({"type": "system", "text": nickname + " вошёл в мир."})
+    await broadcast({"type": "players", "players": list(caucasus_players.values())})
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if not isinstance(data, dict):
+                continue
+            kind = data.get("type")
+            if kind == "chat":
+                text_value = str(data.get("text", "")).strip()
+                if not text_value:
+                    continue
+                text_value = text_value[:500]
+                item = {"nickname": nickname, "text": text_value, "created_at": now().isoformat()}
+                caucasus_chat.append(item)
+                del caucasus_chat[:-100]
+                await broadcast({"type": "chat", **item})
+            elif kind == "move":
+                try:
+                    lon = float(data.get("lon"))
+                    lat = float(data.get("lat"))
+                except (TypeError, ValueError):
+                    continue
+                if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+                    continue
+                player["lon"] = lon
+                player["lat"] = lat
+                await broadcast({"type": "players", "players": list(caucasus_players.values())})
+            elif kind == "signal":
+                target = str(data.get("to", ""))
+                if target != uid and target in caucasus_sockets:
+                    signal_data = data.get("signal")
+                    if isinstance(signal_data, dict):
+                        await send_json_safe(caucasus_sockets[target],
+                            {"type": "signal", "from": uid, "signal": signal_data})
+            elif kind == "voice-ready":
+                await broadcast({"type": "system", "text": nickname + " готов к голосовому чату."})
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print("Caucasus websocket error:", str(exc))
+    finally:
+        if caucasus_sockets.get(uid) is websocket:
+            caucasus_sockets.pop(uid, None)
+            caucasus_players.pop(uid, None)
+            await broadcast({"type": "system", "text": nickname + " покинул мир."})
+            await broadcast({"type": "players", "players": list(caucasus_players.values())})
