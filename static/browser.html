@@ -27,5 +27,7 @@ async function openPinSite(name, requestedPath=''){
   status.textContent='Открыт '+siteName+'.pin';
  }catch(e){status.textContent=e.message||'Не удалось открыть .pin сайт.';}
 }
+function loadSiteFromQuery(){const params=new URLSearchParams(location.search);const site=params.get('site');if(site&&/^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/i.test(site)){field.value=site+'.pin';navigate(field.value);}}
 form.addEventListener('submit',e=>{e.preventDefault();navigate(field.value);});
+loadSiteFromQuery();
 </script></body></html>
