@@ -375,6 +375,18 @@ async def pinstagram_register(payload: PinstagramRegisterInput, request: Request
         raise HTTPException(400, "Аватар должен быть JPEG, PNG, WEBP или GIF размером до 1,2 МБ.")
     existing = await db.pinstagram_users.find_one({"nickname_lower": nickname.lower()})
     if existing:
+        # Repair an account created by the initial prototype, which inserted the
+        # user before its JSON response failed on datetime serialization.
+        has_activity = await db.pinstagram_posts.find_one({"author_id": existing["_id"]}, {"_id": 1})
+        if not existing.get("password_hash") and not has_activity:
+            password_fields = pinstagram_password_hash(payload.password)
+            updates = {"$set": {**password_fields, "avatar_data": payload.avatar_data or existing.get("avatar_data")}}
+            await db.pinstagram_users.update_one({"_id": existing["_id"], "password_hash": {"$exists": False}}, updates)
+            repaired = await db.pinstagram_users.find_one({"_id": existing["_id"]})
+            if repaired and pinstagram_password_matches(repaired, payload.password):
+                response = JSONResponse({"ok": True, "user": pinstagram_public_user(repaired)})
+                pinstagram_set_cookie(response, str(repaired["_id"]))
+                return response
         raise HTTPException(409, "Этот никнейм уже зарегистрирован. Войди через форму входа.")
     uid = uuid.uuid4().hex
     user = {"_id": uid, "nickname": nickname, "nickname_lower": nickname.lower(),
