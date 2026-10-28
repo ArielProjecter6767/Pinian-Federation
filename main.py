@@ -277,3 +277,191 @@ async def command(data:CommandInput,request:Request):
         await db.moderation_log.insert_one({"actor_id":u["_id"],"target_id":target_id,"new_index":level,"created_at":now()})
         return {"ok":True,"message":f"Индекс пользователя изменён на {level}"}
     raise HTTPException(400,"Неизвестная команда")
+
+
+# Pinstagram social app API
+from pydantic import ConfigDict
+
+pinstagram_serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="pinstagram-session-v1")
+PINSTAGRAM_SESSION_COOKIE = "pinstagram_session"
+PINSTAGRAM_SESSION_MAX_AGE = 31536000
+
+class PinstagramRegisterInput(BaseModel):
+    nickname: str = Field(min_length=3, max_length=24, pattern=r"^[A-Za-z0-9_.]+$")
+    avatar_data: Optional[str] = Field(default=None, max_length=1700000)
+
+class PinstagramPostInput(BaseModel):
+    caption: str = Field(default="", max_length=2000)
+    image_data: str = Field(min_length=20, max_length=7500000)
+
+class PinstagramCommentInput(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+
+def pinstagram_public_user(user):
+    if not user:
+        return None
+    return {"id": str(user.get("_id", "")), "nickname": user.get("nickname", "user"),
+            "avatar_data": user.get("avatar_data"), "created_at": user.get("created_at")}
+
+def pinstagram_session_user(request: Request):
+    token = request.cookies.get(PINSTAGRAM_SESSION_COOKIE)
+    if not token:
+        return None
+    try:
+        data = pinstagram_serializer.loads(token, max_age=PINSTAGRAM_SESSION_MAX_AGE)
+        return str(data.get("uid") or "") or None
+    except (BadSignature, SignatureExpired):
+        return None
+
+async def pinstagram_require_user(request: Request):
+    if db is None:
+        raise HTTPException(503, "MongoDB is not configured.")
+    uid = pinstagram_session_user(request)
+    if not uid:
+        raise HTTPException(401, "Войди в Pinstagram.")
+    user = await db.pinstagram_users.find_one({"_id": uid})
+    if not user:
+        raise HTTPException(401, "Пользователь не найден. Войди снова.")
+    return user
+
+def pinstagram_set_cookie(response, uid):
+    response.set_cookie(PINSTAGRAM_SESSION_COOKIE, pinstagram_serializer.dumps({"uid": uid}),
+        httponly=True, secure=True, samesite="lax", max_age=PINSTAGRAM_SESSION_MAX_AGE, path="/")
+
+def pinstagram_valid_image(value, max_chars):
+    if not isinstance(value, str) or len(value) > max_chars:
+        return False
+    return bool(re.match(r"^data:image/(?:jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/=]+$", value))
+
+@app.get("/pinstagram", response_class=HTMLResponse)
+async def pinstagram_page():
+    with open("static/pinstagram.html", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/api/pinstagram/me")
+async def pinstagram_me(request: Request):
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    uid = pinstagram_session_user(request)
+    user = await db.pinstagram_users.find_one({"_id": uid}) if uid else None
+    return {"user": pinstagram_public_user(user)}
+
+@app.post("/api/pinstagram/register")
+async def pinstagram_register(payload: PinstagramRegisterInput, request: Request):
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    nickname = payload.nickname.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.]{3,24}", nickname):
+        raise HTTPException(400, "Никнейм должен содержать 3–24 латинских символа, цифры, точку или подчёркивание.")
+    if payload.avatar_data and not pinstagram_valid_image(payload.avatar_data, 1600000):
+        raise HTTPException(400, "Аватар должен быть JPEG, PNG, WEBP или GIF размером до 1,2 МБ.")
+    existing = await db.pinstagram_users.find_one({"nickname_lower": nickname.lower()})
+    if existing:
+        raise HTTPException(409, "Этот никнейм уже зарегистрирован. Войди через форму входа.")
+    uid = uuid.uuid4().hex
+    user = {"_id": uid, "nickname": nickname, "nickname_lower": nickname.lower(),
+            "avatar_data": payload.avatar_data, "created_at": now()}
+    await db.pinstagram_users.insert_one(user)
+    response = JSONResponse({"ok": True, "user": pinstagram_public_user(user)})
+    pinstagram_set_cookie(response, uid)
+    return response
+
+@app.post("/api/pinstagram/login")
+async def pinstagram_login(payload: PinstagramRegisterInput, request: Request):
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    nickname = payload.nickname.strip()
+    user = await db.pinstagram_users.find_one({"nickname_lower": nickname.lower()})
+    if not user:
+        raise HTTPException(404, "Такой никнейм ещё не зарегистрирован.")
+    # Nickname-only sign-in is intentionally simple but does not prove account ownership.
+    if payload.avatar_data and pinstagram_valid_image(payload.avatar_data, 1600000):
+        await db.pinstagram_users.update_one({"_id": user["_id"]}, {"$set": {"avatar_data": payload.avatar_data}})
+        user["avatar_data"] = payload.avatar_data
+    response = JSONResponse({"ok": True, "user": pinstagram_public_user(user)})
+    pinstagram_set_cookie(response, str(user["_id"]))
+    return response
+
+@app.post("/api/pinstagram/logout")
+async def pinstagram_logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(PINSTAGRAM_SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
+    return response
+
+@app.get("/api/pinstagram/posts")
+async def pinstagram_posts(request: Request):
+    if db is None:
+        raise HTTPException(503, "MongoDB не настроена")
+    user = await pinstagram_require_user(request)
+    cursor = db.pinstagram_posts.find({}).sort("created_at", -1).limit(100)
+    docs = await cursor.to_list(length=100)
+    following_docs = await db.pinstagram_follows.find({"follower_id": user["_id"]}).to_list(length=2000)
+    following_ids = {d["followed_id"] for d in following_docs}
+    ids = list({d.get("author_id") for d in docs if d.get("author_id")})
+    authors = await db.pinstagram_users.find({"_id": {"$in": ids}}).to_list(length=200)
+    author_map = {a["_id"]: a for a in authors}
+    out = []
+    for post in docs:
+        author = author_map.get(post.get("author_id"))
+        if not author:
+            continue
+        comments = (post.get("comments") or [])[-30:]
+        out.append({"id": str(post["_id"]), "author": pinstagram_public_user(author),
+            "caption": post.get("caption", ""), "image_data": post.get("image_data", ""),
+            "created_at": post.get("created_at", ""), "like_count": len(post.get("likes") or []),
+            "liked_by_me": user["_id"] in (post.get("likes") or []), "comment_count": len(post.get("comments") or []),
+            "comments": [{"nickname": c.get("nickname", "user"), "text": c.get("text", ""), "created_at": c.get("created_at", "")} for c in comments],
+            "is_following_author": post.get("author_id") in following_ids})
+    return {"posts": out, "following": list(following_ids)}
+
+@app.post("/api/pinstagram/posts")
+async def pinstagram_create_post(payload: PinstagramPostInput, request: Request):
+    user = await pinstagram_require_user(request)
+    if not pinstagram_valid_image(payload.image_data, 7200000):
+        raise HTTPException(400, "Фото должно быть JPEG, PNG, WEBP или GIF.")
+    post = {"_id": uuid.uuid4().hex, "author_id": user["_id"], "caption": payload.caption.strip(),
+            "image_data": payload.image_data, "likes": [], "comments": [], "created_at": now()}
+    await db.pinstagram_posts.insert_one(post)
+    return {"ok": True, "id": post["_id"]}
+
+@app.post("/api/pinstagram/posts/{post_id}/like")
+async def pinstagram_toggle_like(post_id: str, request: Request):
+    user = await pinstagram_require_user(request)
+    post = await db.pinstagram_posts.find_one({"_id": post_id}, {"likes": 1})
+    if not post:
+        raise HTTPException(404, "Публикация не найдена.")
+    likes = post.get("likes") or []
+    if user["_id"] in likes:
+        await db.pinstagram_posts.update_one({"_id": post_id}, {"$pull": {"likes": user["_id"]}})
+        return {"ok": True, "liked": False}
+    await db.pinstagram_posts.update_one({"_id": post_id}, {"$addToSet": {"likes": user["_id"]}})
+    return {"ok": True, "liked": True}
+
+@app.post("/api/pinstagram/posts/{post_id}/comments")
+async def pinstagram_add_comment(post_id: str, payload: PinstagramCommentInput, request: Request):
+    user = await pinstagram_require_user(request)
+    text_value = payload.text.strip()
+    if not text_value:
+        raise HTTPException(400, "Комментарий не может быть пустым.")
+    result = await db.pinstagram_posts.update_one({"_id": post_id},
+        {"$push": {"comments": {"$each": [{"user_id": user["_id"], "nickname": user["nickname"],
+          "text": text_value, "created_at": now()}], "$slice": -500}}})
+    if not result.matched_count:
+        raise HTTPException(404, "Публикация не найдена.")
+    return {"ok": True}
+
+@app.post("/api/pinstagram/follow/{target_id}")
+async def pinstagram_toggle_follow(target_id: str, request: Request):
+    user = await pinstagram_require_user(request)
+    if target_id == user["_id"]:
+        raise HTTPException(400, "Нельзя подписаться на самого себя.")
+    target = await db.pinstagram_users.find_one({"_id": target_id}, {"_id": 1})
+    if not target:
+        raise HTTPException(404, "Пользователь не найден.")
+    existing = await db.pinstagram_follows.find_one({"follower_id": user["_id"], "followed_id": target_id})
+    if existing:
+        await db.pinstagram_follows.delete_one({"_id": existing["_id"]})
+        return {"ok": True, "following": False}
+    await db.pinstagram_follows.insert_one({"_id": uuid.uuid4().hex, "follower_id": user["_id"],
+        "followed_id": target_id, "created_at": now()})
+    return {"ok": True, "following": True}
