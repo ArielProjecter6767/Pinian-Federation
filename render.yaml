@@ -14,6 +14,8 @@ services:
         generateValue: true
       - key: OWNER_SECRET
         sync: false
+      - key: CESIUM_ION_TOKEN
+        sync: false
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_MODEL
